@@ -1,7 +1,7 @@
 // File:	thread-worker.c
 
 // List all group member's name:
-/*
+/* Nicholas Chen
  */
 // username of iLab:
 // iLab Server:
@@ -11,134 +11,148 @@
 
 #define STACK_SIZE 16 * 1024
 #define QUANTUM 10 * 1000
+#define THREAD_AMT 4096
+
+#define NUM_LEVELS 4 // You can adjust the number of priority levels as needed
+q_t mlfq[NUM_LEVELS];
+// Add a variable to keep track of the current priority level
+// int current_priority = 0;
+// Add a variable to store the time quantum for each priority level
+int quantum[NUM_LEVELS] = {10, 20, 40, 80};
+
+static int is_running[THREAD_AMT];
+static void *return_value[THREAD_AMT];
 
 // INITIALIZE ALL YOUR OTHER VARIABLES HERE
-int init_scheduler_done = 0;
-static runQueue *ready_queue = NULL;
-static tcb *running_thread = NULL; // Queue for ready threads
-static struct itimerval timer;
-static ucontext_t scheduler_context, main_context;
+int init_sched_finish = 0;
+worker_t id = 0;
+ucontext_t sched_context, main_context;
+q_t q;
+
+// Forward Declarations
+void pre_schedule();
+void init_scheduler();
+static void sched_rr();
+static void sched_mlfq();
+void enqueue(tcb *thread);
+tcb *dequeue(q_t *q);
+ucontext_t create_start_worker_context(ucontext_t *uctx);
+void start_worker(ucontext_t *ctx);
+void mlfq_enqueue(tcb *thread, int priority);
+tcb *mlfq_dequeue(int priority);
 
 /* create a new thread */
 int worker_create(worker_t *thread, pthread_attr_t *attr,
                   void *(*function)(void *), void *arg)
 {
-    // - create Thread Control Block (TCB)
-    // - create and initialize the context of this worker thread
-    // - allocate space of stack for this thread to run
-    // after everything is set, push this thread into run queue and
-    // - make it ready for the execution.
-
-    if (!init_scheduler_done)
-    {
-        init_scheduler();
-        init_scheduler_done = 1;
-    }
-
+    // Create Thread Control Block (TCB)
     tcb *new_tcb = (tcb *)malloc(sizeof(tcb));
     if (new_tcb == NULL)
     {
-        // Handle memory allocation error
-        return -1;
-    }
-
-    // Initialize the new thread
-    new_tcb->thread_id = *thread;
-    new_tcb->thread_status = READY;
-    new_tcb->thread_stack = malloc(STACK_SIZE);
-    if (new_tcb->thread_stack == NULL)
-    {
-        // Handle memory allocation error
-        return -1;
-    }
-    new_tcb->stack_size = STACK_SIZE;
-    new_tcb->priority = 0; // Set a default priority for new threads
-    new_tcb->return_value = NULL;
-
-    // Initialize the thread context
-    if (getcontext(&(new_tcb->thread_context)) < 0)
-    {
-        perror("getcontext");
+        perror("MallocTCB");
         exit(1);
     }
-    new_tcb->thread_context.uc_stack.ss_sp = new_tcb->thread_stack;
-    new_tcb->thread_context.uc_stack.ss_size = STACK_SIZE;
-    new_tcb->thread_context.uc_link = NULL;
-    new_tcb->thread_context.uc_stack.ss_flags = 0;
-    makecontext(&new_tcb->thread_context, (void (*)(void))function, 1, arg);
 
-    tcbNode *new_thread_node = (tcbNode *)malloc(sizeof(tcbNode));
-    if (new_thread_node == NULL)
+    ucontext_t *context = malloc(sizeof(ucontext_t));
+    if (context == NULL)
     {
-        // Handle memory allocation error
-        return -1;
+        free(context);
     }
-    // Initialize the new thread node
-    new_thread_node->thread_data = new_tcb;
-    new_thread_node->next = NULL;
 
-    // Add the new thread to the ready queue
-    enqueue(ready_queue, new_thread_node);
+    // Set thread ID
+    new_tcb->thread_id = id++;
+    *thread = id - 1;
+    is_running[id - 1] = 1;
+    // Set thread status
+    new_tcb->status = THREAD_STATUS_READY;
+    // set priority for MLFQ as random number
+    new_tcb->priority = rand() % NUM_LEVELS;
+    // Create and initialize the context of this worker thread
+    if (getcontext(context) < 0)
+    {
+        free(new_tcb);
+        exit(1); // Failed to get context
+    }
+    // Allocate space for the stack
+    void *stack = malloc(STACK_SIZE);
 
+    if (stack == NULL)
+    {
+        free(new_tcb);
+        free(context);
+        exit(1); // Failed to allocate memory for the stack
+    }
+
+    context->uc_stack.ss_sp = stack;
+    context->uc_stack.ss_size = STACK_SIZE;
+    context->uc_link = NULL;
+    context->uc_flags = 0;
+    context->uc_stack.ss_flags = 0;
+
+    // Set up the new context to execute the function when it is swapped in.
+    makecontext(context, (void (*)(void))function, 1, arg);
+    new_tcb->context = create_start_worker_context(context);
+
+    // After everything is set, push this thread into run queue and make it ready for the execution.
+    // push_to_run_queue(new_tcb);
+    enqueue(new_tcb);
+    // push to mlfq
+    mlfq_enqueue(new_tcb, new_tcb->priority);
+
+    if (init_sched_finish == 0)
+    {
+        init_scheduler();
+    }
     return 0;
 }
 
 /* give CPU possession to other user-level worker threads voluntarily */
 int worker_yield()
 {
-
-    // - change worker thread's state from Running to Ready
-    // - save context of this thread to its thread control block
-    // - switch from thread context to scheduler context
-    if (running_thread == NULL || ready_queue->size == 0 || running_thread->thread_status != RUNNING)
+    if (swapcontext(&q.head->data->context, &sched_context) < 0)
     {
-        // Nothing to yield to
-        return -1;
-    }
-
-    running_thread->thread_status = READY;
-    if (getcontext(&(running_thread->thread_context)) < 0)
-    {
-        perror("getcontext");
+        perror("swapcontext");
         exit(1);
     }
 
-    swapcontext(&(running_thread->thread_context), &scheduler_context);
     return 0;
-};
+}
 
 /* terminate a thread */
 void worker_exit(void *value_ptr)
 {
-    // - if value_ptr is provided, save return value
-    // - de-allocate any dynamic memory created when starting this thread (could be done here or elsewhere)
-    if (running_thread == NULL)
-    {
-        return;
-    }
-    if (value_ptr != NULL)
-    {
-        running_thread->return_value = value_ptr;
-    }
-    running_thread->thread_status = TERMINATED;
-
-    // Free the stack memory allocated for this thread
-    free(running_thread->thread_stack);
-
-    // Free the TCB memory allocated for this thread
-    free(running_thread);
-
-    // Context switch back to the scheduler
-    swapcontext(&(scheduler_context), &(main_context));
+    // Set status of current thread and free the stack and the tcb
+    q.head->data->status = THREAD_STATUS_FINISHED;
+    return_value[q.head->data->thread_id] = value_ptr;
+    is_running[q.head->data->thread_id] = 0;
+    free(q.head->data->context.uc_stack.ss_sp);
+    mlfq_dequeue(q.head->data->priority);
+    // Move to schedule context
+    setcontext(&sched_context);
+    exit(1);
+    return;
 }
 
 /* Wait for thread termination */
 int worker_join(worker_t thread, void **value_ptr)
 {
 
+    q.head->data->yield_id = thread;
+    q.head->data->status = THREAD_STATUS_BLOCKED;
     // - wait for a specific thread to terminate
     // - if value_ptr is provided, retrieve return value from joining thread
     // - de-allocate any dynamic memory created by the joining thread
+
+    if (swapcontext(&q.head->data->context, &sched_context) < 0)
+    {
+        perror("swapcontext");
+        exit(1);
+    }
+    if (value_ptr == NULL)
+    {
+        return 0;
+    }
+    *value_ptr = return_value[q.head->data->yield_id];
     return 0;
 };
 
@@ -147,113 +161,35 @@ int worker_mutex_init(worker_mutex_t *mutex,
                       const pthread_mutexattr_t *mutexattr)
 {
     //- initialize data structures for this mutex
-    if (mutex == NULL)
-    {
-        return -1;
-    }
-    // Check if the mutex is already initialized
-    if (mutex->is_locked)
-    {
-        return -1; // Mutex is already initialized
-    }
-
-    // Initialize the mutex
-    mutex->is_locked = 0;
-    mutex->locking_thread = NULL;
-    mutex->blocked_threads.head = NULL;
-    mutex->blocked_threads.tail = NULL;
-    mutex->blocked_threads.size = 0;
+    __atomic_clear(&mutex->is_locked, __ATOMIC_SEQ_CST);
     return 0;
 };
 
 /* aquire the mutex lock */
 int worker_mutex_lock(worker_mutex_t *mutex)
 {
-
-    // - use the built-in test-and-set atomic function to test the mutex
-    // - if the mutex is acquired successfully, enter the critical section
-    // - if acquiring mutex fails, push current thread into block list and
-    // context switch to the scheduler thread
-    if (mutex == NULL)
+    while (__atomic_test_and_set(&mutex->is_locked, __ATOMIC_SEQ_CST))
     {
-        return -1; // Invalid mutex
+        worker_yield();
     }
-    // Check if the mutex is already locked
-    while (__sync_lock_test_and_set(&(mutex->locked), 1))
-    {
-
-        // If the mutex is already locked, block the current thread
-        tcbNode *blocked_thread_node = (tcbNode *)malloc(sizeof(tcbNode));
-        blocked_thread_node->thread_data = running_thread;
-        blocked_thread_node->next = NULL;
-        enqueue(&(mutex->blocked_threads), blocked_thread_node);
-        running_thread->thread_status = BLOCKED;
-
-        // Switch to the scheduler context
-        swapcontext(&(running_thread->thread_context), &scheduler_context);
-    }
-
-    // Lock the mutex
-    mutex->is_locked = 1;
-    mutex->locking_thread = running_thread;
-
     return 0;
 };
 
 /* release the mutex lock */
 int worker_mutex_unlock(worker_mutex_t *mutex)
 {
-    // - release mutex and make it available again.
-    // - put one or more threads in block list to run queue
-    // so that they could compete for mutex later.
-    // Check if the calling thread holds the mutex
-    if (mutex == NULL)
-    {
-        return -1;
-    }
-    if (mutex->locking_thread != running_thread)
-    {
-        return -1; // Calling thread does not hold the mutex
-    }
+    __atomic_clear(&mutex->is_locked, __ATOMIC_SEQ_CST);
 
-    // Unlock the mutex
-    mutex->is_locked = 0;
-    mutex->locking_thread = NULL;
-    // Move a waiting thread from the blocked list to the ready queue
-    if (mutex->blocked_threads.size > 0)
-    {
-        tcbNode *thread_to_release = dequeue(&(mutex->blocked_threads));
-        enqueue(ready_queue, thread_to_release);
-    }
     return 0;
 };
 
 /* destroy the mutex */
 int worker_mutex_destroy(worker_mutex_t *mutex)
 {
+    __atomic_clear(&mutex->is_locked, __ATOMIC_SEQ_CST);
+
     // - make sure mutex is not being used
     // - de-allocate dynamic memory created in worker_mutex_init
-    // Check if the mutex is currently locked
-    if (mutex == NULL)
-    {
-        return -1;
-    }
-    if (mutex->is_locked)
-    {
-        return -1; // Mutex is still locked, cannot destroy
-    }
-
-    // Reset the mutex
-    mutex->is_locked = 0;
-    mutex->locking_thread = NULL;
-
-    while (mutex->blocked_threads.head != NULL)
-    {
-        tcbNode *temp = mutex->blocked_threads.head;
-        mutex->blocked_threads.head = mutex->blocked_threads.head->next;
-        free(temp);
-    }
-    mutex->blocked_threads.head = mutex->blocked_threads.tail = NULL;
 
     return 0;
 };
@@ -261,183 +197,284 @@ int worker_mutex_destroy(worker_mutex_t *mutex)
 /* scheduler */
 static void schedule()
 {
-// - every time a timer interrupt occurs, your worker thread library
-// should be contexted switched from a thread context to this
-// schedule() function
+    // - every time a timer interrupt occurs, your worker thread library
+    // should be contexted switched from a thread context to this
+    // schedule() function
 
-// - invoke scheduling algorithms according to the policy (RR or MLFQ)
+    // - invoke scheduling algorithms according to the policy (RR or MLFQ)
 
-// - schedule policy
+    // - schedule policy
+    pre_schedule();
+
 #ifndef MLFQ
     // Choose RR
     sched_rr();
 #else
     // Choose MLFQ
     sched_mlfq();
+
 #endif
 }
 
 static void sched_rr()
 {
-    // - your own implementation of RR
-    // (feel free to modify arguments and return types)
-    // If there are no threads in the ready queue, return
-    if (ready_queue->size == 0)
+    // heart of program
+    tnode_t *temp_node;
+    tcb *t;
+
+    while (q.head != NULL)
     {
-        return;
-    }
+        t = q.head->data;
 
-    // Dequeue the next thread from the ready queue
-    tcbNode *next_thread_node = dequeue(ready_queue);
-    tcb *next_thread = next_thread_node->thread_data;
-
-    // Update the status of the next thread to RUNNING
-    next_thread->thread_status = RUNNING;
-
-    // Save the context of the currently running thread
-    tcb *current_thread = running_thread;
-    if (current_thread != NULL)
-    {
-        current_thread->thread_status = READY;
-        if (getcontext(&(current_thread->thread_context)) < 0)
+        if (t->status == THREAD_STATUS_FINISHED)
         {
-            perror("getcontext");
-            exit(1);
+            dequeue(&q);
+            free(t);
+        }
+        else if (t->status == THREAD_STATUS_BLOCKED)
+        {
+            if (is_running[t->yield_id] == 0)
+            {
+                t->status = THREAD_STATUS_READY;
+            }
+            dequeue(&q);
+            enqueue(t);
+        }
+        else if (t->status == THREAD_STATUS_READY)
+        {
+            t->status = THREAD_STATUS_RUNNING;
+            if (swapcontext(&sched_context, &t->context) < 0)
+            {
+                perror("swapcontext");
+                exit(1);
+            }
+            if (t->status == THREAD_STATUS_RUNNING)
+            {
+                t->status = THREAD_STATUS_READY;
+            }
+            dequeue(&q);
+            enqueue(t);
         }
     }
 
-    // Switch to the context of the next thread
-    running_thread = next_thread;
-    swapcontext(&(current_thread->thread_context), &(next_thread->thread_context));
+    free(sched_context.uc_stack.ss_sp); // empty stack
+    exit(0);
 }
 
 /* Preemptive MLFQ scheduling algorithm */
+
 static void sched_mlfq()
 {
-    // - your own implementation of MLFQ
-    // (feel free to modify arguments and return types)
+    // Choose the thread from the highest-priority non-empty runqueue
+    int i;
+    for (i = 0; i < NUM_LEVELS; i++)
+    {
+        if (mlfq[i].size > 0)
+        {
+            tcb *t = mlfq_dequeue(i);
+            t->status = THREAD_STATUS_RUNNING;
+
+            if (swapcontext(&sched_context, &t->context) < 0)
+            {
+                perror("swapcontext");
+                exit(1);
+            }
+
+            // Check if the thread used up its time quantum
+            if (t->status == THREAD_STATUS_RUNNING)
+            {
+                // Move the thread to a lower-priority queue
+                if (i < NUM_LEVELS - 1)
+                {
+                    mlfq_enqueue(t, i + 1);
+                }
+                else
+                {
+                    // If it was in the lowest-priority queue, keep it there
+                    mlfq_enqueue(t, i);
+                }
+            }
+            else
+            {
+                // The thread yielded or blocked, keep it in the same queue
+                mlfq_enqueue(t, i);
+            }
+
+            break; // Only choose one thread from the highest-priority queue
+        }
+    }
 }
 
 // Feel free to add any other functions you need.
 // You can also create separate files for helper functions, structures, etc.
 // But make sure that the Makefile is updated to account for the same.
 
-// Initialize the scheduler
-void init_scheduler()
+// HELPER FUNCTIONS HERE
+
+void enqueue(tcb *thread)
 {
-    // Initialize main context
-    if (getcontext(&main_context) < 0)
+    tnode_t *node = (tnode_t *)malloc(sizeof(tnode_t));
+    node->next = NULL;
+    node->data = thread;
+
+    if (q.head == NULL)
     {
-        perror("getcontext");
-        exit(1);
-    }
-
-    // Allocate space for the scheduler stack
-    void *scheduler_stack = malloc(STACK_SIZE);
-
-    if (scheduler_stack == NULL)
-    {
-        perror("Failed to allocate stack for scheduler");
-        exit(1);
-    }
-
-    // Initialize scheduler context
-    if (getcontext(&scheduler_context) < 0)
-    {
-        perror("getcontext");
-        exit(1);
-    }
-    scheduler_context.uc_link = &main_context;
-    scheduler_context.uc_stack.ss_sp = scheduler_stack;
-    scheduler_context.uc_stack.ss_size = STACK_SIZE;
-    scheduler_context.uc_stack.ss_flags = 0;
-
-    // Make the scheduler context to start running at the schedule() function
-    makecontext(&scheduler_context, schedule, 0);
-
-    // Initialize the ready queue
-    ready_queue = (runQueue *)malloc(sizeof(runQueue));
-    ready_queue->head = ready_queue->tail = NULL;
-    ready_queue->size = 0;
-
-    // setup timer
-    setup_timer();
-}
-// Function to set up the timer
-static void setup_timer()
-{
-    // Use sigaction to register signal handler
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = &schedule; // schedule function is the signal handler everytime theres an interrupt
-    sigaction(SIGPROF, &sa, NULL);
-
-    // Create timer struct
-    struct itimerval timer;
-
-    // Set up what the timer should reset to after the timer goes off
-    timer.it_interval.tv_usec = QUANTUM % 1000000;
-    timer.it_interval.tv_sec = QUANTUM / 1000000;
-
-    // Set up the current timer to go off in QUANTUM microseconds
-    timer.it_value.tv_usec = QUANTUM % 1000000;
-    timer.it_value.tv_sec = QUANTUM / 1000000;
-
-    // Set the timer up (start the timer)
-    setitimer(ITIMER_PROF, &timer, NULL);
-}
-// Function to enqueue a thread in the run queue
-void enqueue(runQueue *queue, tcbNode *thread)
-{
-    if (queue->tail == NULL)
-    {
-        queue->head = queue->tail = thread;
+        q.head = node;
+        q.tail = node;
+        q.size = 1;
     }
     else
     {
-        queue->tail->next = thread;
-        queue->tail = thread;
+        q.tail->next = node;
+        q.tail = node;
+        q.size++;
     }
-    // thread->next = NULL;
-    queue->size++;
+    return;
 }
-// Function to dequeue a thread from the run queue
-tcbNode *dequeue(runQueue *queue)
+
+tcb *dequeue(q_t *q)
 {
-    if (queue->head == NULL)
-    {
-        // Queue is empty
-        return NULL;
-    }
+    if (q->head == NULL)
+        return NULL; // queue must be empty
 
-    tcbNode *dequeued_thread = queue->head;
-    queue->head = queue->head->next;
+    tnode_t *temp_node = q->head;
+    tcb *thread = temp_node->data;
 
-    if (queue->head == NULL)
-    {
-        // If the queue becomes empty after dequeue, update the tail pointer
-        queue->tail = NULL;
-    }
-
-    queue->size--;
-
-    return dequeued_thread;
+    q->head = q->head->next; // remove beginning node;
+    free(temp_node);
+    return thread;
 }
 
-// tcb *get_running_thread()
-// {
-//     tcbNode *current_node = ready_queue->head;
+void timer_signal_handler(int signum)
+{
+    ucontext_t curr_context;
+    getcontext(&curr_context);
+    if (curr_context.uc_stack.ss_sp != curr_context.uc_stack.ss_sp)
+    {
 
-//     while (current_node != NULL)
-//     {
-//         tcb *current_thread = current_node->thread_data;
-//         if (current_thread->thread_status == RUNNING)
-//         {
-//             return current_thread;
-//         }
+        if (swapcontext(&q.head->data->context, &sched_context) < 0)
+        {
+            perror("swapcontext");
+            exit(1);
+        }
+    }
+    return;
+}
 
-//         current_node = current_node->next;
-//     }
+void init_scheduler()
+{
+    getcontext(&sched_context);
+    sched_context.uc_stack.ss_sp = malloc(STACK_SIZE);
+    sched_context.uc_stack.ss_size = STACK_SIZE;
+    sched_context.uc_stack.ss_flags = 0;
+    sched_context.uc_link = 0;
+    makecontext(&sched_context, &schedule, 0);
 
-//     return NULL;
-// }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = &timer_signal_handler;
+    sigaction(SIGPROF, &sa, NULL);
+
+    struct itimerval timer;
+
+    timer.it_interval.tv_usec = QUANTUM;
+    timer.it_interval.tv_sec = 0;
+    timer.it_value.tv_usec = QUANTUM;
+    timer.it_value.tv_sec = 0;
+
+    // Set the timer up (start the timer)
+    setitimer(ITIMER_PROF, &timer, NULL);
+
+    tcb *starttcb = (tcb *)malloc(sizeof(tcb));
+    starttcb->thread_id = id++;
+    is_running[id] = 1;
+    starttcb->status = THREAD_STATUS_READY;
+
+    init_sched_finish = 1;
+    enqueue(starttcb);
+
+    swapcontext(&main_context, &sched_context);
+
+    return;
+}
+
+ucontext_t create_start_worker_context(ucontext_t *uctx)
+{
+    ucontext_t context;
+    if (getcontext(&context) < 0)
+    {
+        perror("getContext err");
+        exit(1);
+    };
+    void *stack = malloc(STACK_SIZE);
+    context.uc_link = NULL;
+    context.uc_stack.ss_sp = stack;
+    context.uc_stack.ss_size = STACK_SIZE;
+    context.uc_stack.ss_flags = 0;
+    makecontext(&context, (void *)&start_worker, 1, uctx);
+    return context;
+}
+
+void start_worker(ucontext_t *ctx)
+{
+    if (ctx == NULL)
+    {
+        return;
+    }
+    setcontext(ctx);
+
+    // on failure we will free all the data
+    free(ctx->uc_stack.ss_sp);
+    free(ctx);
+    worker_exit(NULL);
+    return;
+}
+
+void pre_schedule()
+{
+    tnode_t *temp = q.head;
+
+    while (temp != NULL)
+    {
+        if (temp->data->thread_id != 1)
+        {
+            temp = temp->next;
+        }
+        temp->data->context = create_start_worker_context(&main_context);
+        break;
+    }
+}
+
+void mlfq_enqueue(tcb *thread, int priority)
+{
+    tnode_t *node = (tnode_t *)malloc(sizeof(tnode_t));
+    node->next = NULL;
+    node->data = thread;
+
+    if (mlfq[priority].head == NULL)
+    {
+        mlfq[priority].head = node;
+        mlfq[priority].tail = node;
+        mlfq[priority].size = 1;
+    }
+    else
+    {
+        mlfq[priority].tail->next = node;
+        mlfq[priority].tail = node;
+        mlfq[priority].size++;
+    }
+    return;
+}
+
+tcb *mlfq_dequeue(int priority)
+{
+    if (mlfq[priority].head == NULL)
+        return NULL; // queue must be empty
+
+    tnode_t *temp_node = mlfq[priority].head;
+    tcb *thread = temp_node->data;
+
+    mlfq[priority].head = mlfq[priority].head->next; // remove beginning node;
+    free(temp_node);
+    return thread;
+}

@@ -5,47 +5,35 @@
 
 typedef unsigned int worker_t;
 
-typedef enum status
+typedef enum
 {
-    NEW,
-    READY,
-    RUNNING,
-    BLOCKED,
-    TERMINATED
-} status;
+    THREAD_STATUS_READY,
+    THREAD_STATUS_RUNNING,
+    THREAD_STATUS_BLOCKED,
+    THREAD_STATUS_FINISHED
+} thread_status_t;
 
 typedef struct TCB
 {
-    /* add important states in a thread control block */
-    // thread Id
-    // thread status
-    // thread context
-    // thread stack
-    // thread priority
-    // And more ...
-
-    // YOUR CODE HERE
-    worker_t thread_id;
-    status thread_status;
-    ucontext_t thread_context;
-    void *thread_stack; // Base address of the thread's stack
-    size_t stack_size;
-    int priority;
-    void *return_value;
-
+    worker_t thread_id;     // unique thread ID
+    worker_t yield_id;      // yielding id
+    thread_status_t status; // thread status
+    ucontext_t context;     // thread context
+    int priority;           // Priority level of the thread
 } tcb;
 
-typedef struct tcbNode
+typedef struct ThreadNode
 {
-    tcb *thread_data;
-    struct tcbNode *next;
-} tcbNode;
+    tcb *data;
+    struct ThreadNode *next;
+    int test_var;
+} tnode_t;
 
-typedef struct runQueue
+typedef struct Queue
 {
-    tcbNode *head;
-    tcbNode *tail;
+    tnode_t *head;
+    tnode_t *tail;
     int size;
-} runQueue;
+} q_t;
 
 #endif
